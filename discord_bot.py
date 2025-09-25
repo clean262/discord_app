@@ -19,6 +19,12 @@ client = discord.Client(intents=intents, max_messages=10000)
 
 DB_PATH = os.path.expanduser("~/discord_ingest.sqlite3")
 
+ALLOWED_TYPES = {
+    discord.MessageType.default,
+    discord.MessageType.reply,
+    discord.MessageType.thread_starter_message,  # 必要なら
+}
+
 # --------- キュー & ワーカー設定 ---------
 QUEUE_MAXSIZE = 5000
 BATCH_SIZE    = 200
@@ -267,9 +273,9 @@ async def writer_worker():
 
 # ----------------- Discordイベント → キュー投入 -----------------
 async def enqueue_upsert(m: discord.Message):
-    if m.author.bot or m.type != discord.MessageType.default:
+    if m.author.bot:
         return
-    if write_queue is None:
+    if m.type not in ALLOWED_TYPES:
         return
     reply_to = getattr(m.reference, "message_id", None) if m.reference else None
     parent_id, thread_id, source_id = _split_channel_ids(m.channel)
@@ -378,6 +384,57 @@ async def backfill_all():
                 await asyncio.sleep(2)
     print("[ingest] backfill queued")
 
+
+# 追加：メッセージのリアクションを“正値”で再集計して保存
+recount_tasks: dict[str, asyncio.Task] = {}
+
+async def recount_message_reactions(channel_id: int, message_id: int, delay: float = 0.35):
+    """短いdelay後にfetch→reaction_setで正値書き込み。未登録メッセージはupsertする"""
+    key = f"{channel_id}:{message_id}"
+
+    # 既存タスクがあればキャンセル（デバウンス）
+    old = recount_tasks.get(key)
+    if old and not old.done():
+        old.cancel()
+
+    async def _job():
+        try:
+            await asyncio.sleep(delay)  # デバウンス
+            ch = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
+            msg = await ch.fetch_message(message_id)
+
+            # 念のためメッセージ自体もUpsert（未登録/遅延対策）
+            await enqueue_upsert(msg)
+
+            nowiso = now_utc_iso()
+            # 全リアクションを“set”で正値保存
+            for r in getattr(msg, "reactions", []) or []:
+                try:
+                    key, name, is_custom = _emoji_key_name_iscustom(r.emoji)
+                    count = int(getattr(r, "count", 0) or 0)
+                    if write_queue is not None:
+                        await write_queue.put((
+                            "reaction_set",
+                            (str(msg.id), key, name, is_custom, count, nowiso)
+                        ))
+                except Exception as e:
+                    print("[reactions][recount-encode-error]", repr(e))
+            # 0個になった絵文字は RawReactionClearEmoji が来ないケースがあるため、
+            # 一旦全部消してから現在の集合をsetするやり方も可。
+            # 必要なら下記を有効化：
+            # await write_queue.put(("reaction_clear_message", str(msg.id)))
+            # その後で for r in msg.reactions で set を投げる。
+
+            # 念のためflush（バースト時は不要なら外してOK）
+            await write_queue.put(("flush", None))
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print("[reactions][recount-error]", repr(e))
+
+    t = asyncio.create_task(_job())
+    recount_tasks[key] = t
+
 # --------- イベントハンドラ ---------
 @client.event
 async def on_ready():
@@ -440,24 +497,29 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if write_queue is None: return
     key, name, is_custom = _emoji_key_name_iscustom(payload.emoji)
     await write_queue.put(("reaction_delta", (str(payload.message_id), key, name, is_custom, +1, now_utc_iso())))
+    # ★ 追加：正値再集計（返信やキャッシュ外でも確実に反映）
+    asyncio.create_task(recount_message_reactions(payload.channel_id, payload.message_id))
 
 @client.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     if write_queue is None: return
     key, name, is_custom = _emoji_key_name_iscustom(payload.emoji)
     await write_queue.put(("reaction_delta", (str(payload.message_id), key, name, is_custom, -1, now_utc_iso())))
+    asyncio.create_task(recount_message_reactions(payload.channel_id, payload.message_id))
 
 @client.event
 async def on_raw_reaction_clear(payload: discord.RawReactionClearEvent):
     if write_queue is None: return
-    # メッセージの全リアクションが消去された
     await write_queue.put(("reaction_clear_message", str(payload.message_id)))
+    asyncio.create_task(recount_message_reactions(payload.channel_id, payload.message_id))
 
 @client.event
 async def on_raw_reaction_clear_emoji(payload: discord.RawReactionClearEmojiEvent):
     if write_queue is None: return
-    key, name, is_custom = _emoji_key_name_iscustom(payload.emoji)
+    key, _name, _is_custom = _emoji_key_name_iscustom(payload.emoji)
     await write_queue.put(("reaction_clear_emoji", (str(payload.message_id), key)))
+    asyncio.create_task(recount_message_reactions(payload.channel_id, payload.message_id))
+
 
 # --------- シャットダウン ---------
 async def shutdown():
