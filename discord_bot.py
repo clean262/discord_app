@@ -211,8 +211,6 @@ async def enqueue_upsert(m: discord.Message):
 async def enqueue_delete(message_id: int):
     await write_queue.put(("delete", str(message_id)))
 
-
-# --------- バックフィル ---------
 # --------- バックフィル ---------
 
 async def _ingest_thread(th: discord.Thread):
@@ -283,33 +281,6 @@ async def backfill_all():
                 print(f"[warn] {e}; sleeping")
                 await asyncio.sleep(2)
     print("[ingest] backfill queued")
-
-
-# # --------- バックフィル ---------
-# @tasks.loop(count=1)
-# async def backfill_all():
-#     print("[ingest] backfill start")
-#     for guild in client.guilds:
-#         for ch in guild.text_channels:
-#             perms = ch.permissions_for(guild.me)
-#             if not perms.read_messages or not perms.read_message_history:
-#                 continue
-#             try:
-#                 async for m in ch.history(limit=None, oldest_first=True):
-#                     await enqueue_upsert(m)
-#                 # スレッドも
-#                 for th in ch.threads:
-#                     async for m in th.history(limit=None, oldest_first=True):
-#                         await enqueue_upsert(m)
-#                 async for th in ch.archived_threads(limit=None):
-#                     async for m in th.history(limit=None, oldest_first=True):
-#                         await enqueue_upsert(m)
-#             except discord.Forbidden:
-#                 print(f"[skip] no permission for #{ch.name}")
-#             except discord.HTTPException as e:
-#                 print(f"[warn] {e}; sleeping")
-#                 await asyncio.sleep(2)
-#     print("[ingest] backfill queued")
 
 @client.event
 async def on_ready():
