@@ -2,6 +2,12 @@
 # 削除確認 SELECT author_hash, content, created_at FROM messages WHERE deleted = 1 ORDER BY created_at DESC LIMIT 10;
 # Discord のメッセージURLは https://discord.com/channels/<guild_id>/<channel_id>/<message_id>らしい？
 # 特定のチャンネルだけ見る SELECT author_hash, content FROM messages WHERE channel_id = '1419148902879199305' AND deleted = 0 ORDER BY created_at DESC LIMIT 10;
+# -- スレッド名つきで最新10件
+# SELECT thread_id, thread_title, author_hash, substr(content,1,80)
+# FROM messages
+# WHERE deleted = 0
+# ORDER BY created_at DESC
+# LIMIT 10;
 import os, re, hashlib, asyncio, datetime as dt
 import discord
 import aiosqlite
@@ -61,7 +67,8 @@ CREATE TABLE IF NOT EXISTS messages (
   content    TEXT,
   version_tag TEXT,
   url        TEXT,
-  deleted    INTEGER DEFAULT 0
+  deleted    INTEGER DEFAULT 0,
+  thread_title TEXT      
 );
 
 -- 追加インデックス（存在しなければ作成）
@@ -88,13 +95,14 @@ CREATE INDEX IF NOT EXISTS idx_reactions_count ON reactions(count);
 UPSERT_SQL = """
 INSERT INTO messages (
   message_id,guild_id,channel_id,thread_id,source_channel_id,author_hash,created_at,edited_at,
-  reply_to,content,version_tag,url,deleted
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)
+  reply_to,content,version_tag,url,deleted,thread_title
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?)
 ON CONFLICT(message_id) DO UPDATE SET
   edited_at=excluded.edited_at,
   content=excluded.content,
   version_tag=excluded.version_tag,
   source_channel_id=excluded.source_channel_id,
+  thread_title=excluded.thread_title,
   deleted=0;
 """
 
@@ -140,6 +148,7 @@ async def init_db():
     await db.executescript(CREATE_SQL)
     # 既存DBに列が無ければ追加
     await _ensure_column(db, "messages", "source_channel_id", "TEXT")
+    await _ensure_column(db, "messages", "thread_title", "TEXT")
     await db.commit()
 
 writer_task = None
@@ -279,6 +288,9 @@ async def enqueue_upsert(m: discord.Message):
         return
     reply_to = getattr(m.reference, "message_id", None) if m.reference else None
     parent_id, thread_id, source_id = _split_channel_ids(m.channel)
+    thread_title = None
+    if isinstance(m.channel, discord.Thread):
+        thread_title = m.channel.name or None
     payload = (
         str(m.id),
         str(getattr(m.guild, "id", "")),
@@ -291,7 +303,8 @@ async def enqueue_upsert(m: discord.Message):
         str(reply_to) if reply_to else None,
         m.content or "",
         extract_version(m.content or ""),
-        m.jump_url
+        m.jump_url,
+        thread_title,
     )
     try:
         await write_queue.put(("upsert", payload))
